@@ -17,9 +17,11 @@ The upstream GGUF embedding backend is unchanged when a `pplx:` model is not sel
 - Python with `tokenizers`, already included in that mlx-vlm environment.
   No new Python or JavaScript dependencies are introduced by this backend.
 
-QMD sends text to the configured endpoint. Keep the unauthenticated service on
-loopback; do not expose it on a public interface. Changing the endpoint is an
-explicit data-routing decision, not an automatic fallback.
+QMD sends text to the configured endpoint. Prefer loopback plus an SSH tunnel
+for remote access. If binding to a LAN interface, restrict access to trusted
+clients with a firewall; the service is unauthenticated. Do not expose it to the
+public Internet. Changing the endpoint is an explicit data-routing decision,
+not an automatic fallback.
 
 ## Setup on the existing machine
 
@@ -88,21 +90,93 @@ models:
 YAML values do not expand `$HOME` or `~`. Leave `generate` and `rerank` unchanged.
 Normal QMD project-local configuration trust rules still apply.
 
+## Remote server, local tokenizer
+
+The QMD client does **not** need MLX or the model weights. It needs Python with
+`tokenizers` and matching `config.json` / `tokenizer.json` files. The URI path
+is the **client-local tokenizer directory**; optional `remote_model` is the
+**server's model ID**, sent in the HTTP request and checked in the response.
+They can be completely different paths (or the remote ID can be a served alias).
+
+First update the fork on the client (`git pull --ff-only && bun run build` for a
+source checkout). On the embedding host, keep the patched MLX server running.
+For direct LAN access, start it with `--host <HOST_LAN_IP>` instead of localhost
+and allow port 8080 only from trusted clients.
+
+On the client, replace the example host/address and use the exact remote ID
+reported by the host's `/v1/models` endpoint:
+
+```bash
+SERVER="macos@192.168.1.100"
+REMOTE_MODEL="/Users/macos/models/pplx-embed-v2-context-9b-MLX-8bit"
+TOKENIZER_DIR="$HOME/.local/share/qmd/pplx-tokenizer"
+
+mkdir -p "$TOKENIZER_DIR"
+scp "${SERVER}:${REMOTE_MODEL}/config.json" "$TOKENIZER_DIR/"
+scp "${SERVER}:${REMOTE_MODEL}/tokenizer.json" "$TOKENIZER_DIR/"
+
+# CLIENT-side Python with tokenizers installed; no MLX installation needed.
+export QMD_PPLX_PYTHON="/absolute/path/to/client/python"
+export QMD_PPLX_URL="http://192.168.1.100:8080/v1/embeddings"
+export QMD_EMBED_MODEL="pplx:$TOKENIZER_DIR?revision=dab89ff203fc943c4ca16e51c5882ff92790d758-q8&remote_model=$REMOTE_MODEL&dimensions=1024&mode=contextual&max_tokens=8192"
+```
+
+If the client has no Python environment with `tokenizers`, create one:
+
+```bash
+python3 -m venv "$HOME/.venvs/qmd-pplx"
+"$HOME/.venvs/qmd-pplx/bin/python" -m pip install tokenizers
+export QMD_PPLX_PYTHON="$HOME/.venvs/qmd-pplx/bin/python"
+```
+
+For an SSH tunnel instead of exposing the service on the LAN, leave the server
+bound to `127.0.0.1:8080`, run this in a separate client terminal:
+
+```bash
+ssh -N -L 18080:127.0.0.1:8080 macos@192.168.1.100
+```
+
+Then use `QMD_PPLX_URL=http://127.0.0.1:18080/v1/embeddings`. The `remote_model`
+value is unchanged: it identifies the model on the server, not the tunnel.
+
+For an existing named index, update its YAML `models.embed`, not just the
+environment variable. For example, on a Linux client with user `alice`:
+
+```yaml
+models:
+  embed: "pplx:/home/alice/.local/share/qmd/pplx-tokenizer?revision=dab89ff203fc943c4ca16e51c5882ff92790d758-q8&remote_model=/Users/macos/models/pplx-embed-v2-context-9b-MLX-8bit&dimensions=1024&mode=contextual&max_tokens=8192"
+```
+
+Use the normal named-index workflow above. Only embedding inference runs on the
+server; the database, tokenization, GGUF query expansion and reranking remain on
+the QMD client. Native expansion/reranking support still depends on the client's
+platform; `vsearch` needs no client-side GGUF models.
+
+Without `remote_model`, the existing behavior and fingerprints are unchanged:
+the URI path is used both locally and as the HTTP model ID. Adding/changing
+`remote_model` (or moving the local tokenizer directory) changes the embedding
+profile; use a fresh named index or rebuild all collections once with `embed --force`.
+Keep the tokenizer metadata synchronized with the hosted weights/revision.
+
 ## Model URI and transport settings
 
 ```text
-pplx:/absolute/model/directory?revision=WEIGHTS-AND-TOKENIZER-ID&dimensions=1024&mode=contextual&max_tokens=8192
+pplx:/absolute/local/tokenizer/directory?revision=WEIGHTS-AND-TOKENIZER-ID&remote_model=SERVER-MODEL-ID&dimensions=1024&mode=contextual&max_tokens=8192
 ```
 
 | URI parameter | Values | Default |
 | --- | --- | --- |
 | `revision` | Required nonempty identifier; change whenever weights/tokenizer change | None |
+| `remote_model` | Optional nonempty server model ID; no control characters | URI's local directory path |
 | `dimensions` | `1024`, `2048` | `1024` |
 | `mode` | `independent`, `contextual` | `contextual` |
 | `max_tokens` | Integer from `1024` through `8192` | `8192` |
 
 Unknown/duplicate parameters are rejected. Percent-encode reserved characters in
-paths (notably `?` and `#`). `revision` is an index identity supplied by you,
+paths (notably `?` and `#`) and query values (notably `&`, `#`, `%` and `+`).
+The server ID in the example contains only path-safe characters; use
+`URLSearchParams.set("remote_model", id)` when building URIs for arbitrary IDs.
+`revision` is an index identity supplied by you,
 **not a download instruction or automatic cryptographic verification of weights**.
 Use a new revision when replacing files in place.
 
@@ -229,7 +303,11 @@ if not already cached. They do not select a GGUF embedding model.
 
 The offline check covers validation, 64-item request batching, response ordering,
 query-role routing, contextual retry preservation, failure recovery, profile
-isolation, SDK calls, and all three search paths.
+isolation, SDK calls, all three search paths, remote-ID routing/response checks,
+and unchanged fingerprints for legacy URIs. The live check copies only the two
+metadata files into a separate temporary client directory (including spaces,
+Unicode and `#` in its path), then uses `remote_model` for all server requests,
+including source/built CLI search and `doctor`.
 
 Upstream regression commands:
 
@@ -270,6 +348,9 @@ This avoids changing global Git configuration or unrelated upstream tests.
   document first, and structured reranking ranked the gardening document first.
 - Source and built CLI JSON vector search and contextual `doctor` passed. Live
   checks passed under both Bun and Node.
+- Remote-ID separation passed live with a metadata-only client directory different
+  from the server model path, including multi-window indexing, diagnostics and CLI.
+  Legacy URI fingerprints remain unchanged.
 
 These are correctness/smoke checks, **not evidence that PPLX beats QMD's default
 model on your collection**. Evaluate your own queries before replacing a working
@@ -293,4 +374,4 @@ that is not a throughput benchmark.
   is the upgrade path if profiling shows this matters on large indexes.
 - The server-side inference lock bounds memory; concurrent client requests queue
   rather than performing parallel model inference.
-- No boot/login service is installed. The server was stopped after verification.
+- No boot/login service is installed. Start the server explicitly when needed.

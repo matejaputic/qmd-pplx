@@ -13,7 +13,7 @@ export const isPplxModel = (model: string): boolean => model.startsWith("pplx:")
 /** All vector-affecting settings belong in the model URI, not environment variables. */
 export function parsePplxModel(model: string) {
   const uri = new URL(model);
-  const allowed = ["dimensions", "mode", "max_tokens", "revision"];
+  const allowed = ["dimensions", "mode", "max_tokens", "revision", "remote_model"];
   if (uri.protocol !== "pplx:" || uri.host || uri.hash || !uri.pathname.startsWith("/")) {
     throw new Error("PPLX model must be pplx:/absolute/model/path?revision=<weights-revision>");
   }
@@ -32,7 +32,13 @@ export function parsePplxModel(model: string) {
   }
   if (!["contextual", "independent"].includes(mode)) throw new Error("PPLX mode must be contextual or independent");
   if (!revision?.trim()) throw new Error("PPLX revision is required; change it whenever weights/tokenizer change");
-  return { path: decodeURIComponent(uri.pathname), dimensions, maxTokens, mode, revision };
+  const remoteModel = uri.searchParams.get("remote_model");
+  if (remoteModel !== null && (!remoteModel.trim() || /\p{Cc}/u.test(remoteModel))) {
+    throw new Error("PPLX remote_model must be nonempty and contain no control characters");
+  }
+  // Omit absent remote_model so existing index fingerprints remain unchanged.
+  return { path: decodeURIComponent(uri.pathname), dimensions, maxTokens, mode, revision,
+    ...(remoteModel === null ? {} : { remoteModel }) };
 }
 
 /** Model-specific transport; generation and reranking stay in node-llama-cpp. */
@@ -89,14 +95,14 @@ export class PplxEmbeddings {
         method: "POST", redirect: "error",
         signal: options.signal ? AbortSignal.any([timeout, options.signal]) : timeout,
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model: this.config.path,
+        body: JSON.stringify({ model: this.config.remoteModel ?? this.config.path,
           input: options.contextual ? { chunks: batch } : batch,
           task: options.isQuery ? "query" : "document", dimensions: this.config.dimensions,
           normalize_embeddings: true, encoding_format: "float" }),
       });
       if (!response.ok) throw new Error(`PPLX HTTP ${response.status}: ${(await response.text()).slice(0, 500)}`);
       const body = await response.json() as { model?: unknown; data?: unknown };
-      if (body.model !== this.config.path || !Array.isArray(body.data) || body.data.length !== batch.length) {
+      if (body.model !== (this.config.remoteModel ?? this.config.path) || !Array.isArray(body.data) || body.data.length !== batch.length) {
         throw new Error("PPLX response model or vector count mismatch; no vectors stored");
       }
       const ordered = new Array<{ embedding: number[]; model: string }>(batch.length);

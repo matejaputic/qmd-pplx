@@ -13,6 +13,9 @@
 
 ### Added
 
+- Optional `remote_model` in PPLX model URIs separates the server's model ID
+  from the client-local tokenizer directory. Existing URIs/fingerprints remain
+  unchanged; remote clients need only tokenizer metadata, not MLX weights.
 - PPLX MLX embedding backend (`pplx:` model URIs): independent/contextual text
   indexing, exact native-tokenizer budgets, same-document non-overlapping
   windows, query-role routing, contextual retries/diagnostics, and embedding

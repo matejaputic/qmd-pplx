@@ -2,7 +2,8 @@
 // No framework, no production index. --live requires QMD_PPLX_TEST_MODEL and a running MLX server.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, copyFileSync, readdirSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
@@ -16,7 +17,9 @@ import { checkEmbeddingVectorSamples } from "../src/cli/qmd.js";
 import { createStore as createSdkStore } from "../src/index.js";
 import { storedEmbedding } from "../src/vec-layout.js";
 
-const fakeModel = "pplx:/not-loaded/model?revision=check-q8&dimensions=1024&mode=contextual";
+const legacyModel = "pplx:/not-loaded/model?revision=check-q8&dimensions=1024&mode=contextual";
+const remoteModel = "/srv/models/PPLX café ?#%& q8";
+const fakeModel = `${legacyModel}&remote_model=${encodeURIComponent(remoteModel)}`;
 const originalFetch = globalThis.fetch;
 const originalTokenizer = PplxEmbeddings.prototype.tokenizer;
 const originalUrl = process.env.QMD_PPLX_URL;
@@ -53,11 +56,20 @@ async function offline() {
   for (const invalid of ["pplx:relative?revision=x", "pplx://host/path?revision=x", "pplx:/path",
     "pplx:/path?revision=x&dimensions=768", "pplx:/path?revision=x&mode=oops",
     "pplx:/path?revision=x&max_tokens=9000", "pplx:/path?revision=x&dimensions=1024&dimensions=2048",
-    "pplx:/path?revision=x&surprise=1"]) assert.throws(() => parsePplxModel(invalid));
+    "pplx:/path?revision=x&surprise=1", "pplx:/path?revision=x&remote_model=",
+    "pplx:/path?revision=x&remote_model=%20", "pplx:/path?revision=x&remote_model=%00",
+    "pplx:/path?revision=x&remote_model=bad%0Aid", "pplx:/path?revision=x&remote_model=%C2%85",
+    "pplx:/path?revision=x&remote_model=x&remote_model=y"])
+    assert.throws(() => parsePplxModel(invalid));
+  assert.equal(getEmbeddingFingerprint(legacyModel), "adb448", "old index fingerprints must stay unchanged");
+  assert.equal(parsePplxModel(legacyModel).remoteModel, undefined);
+  assert.equal(parsePplxModel(fakeModel).path, "/not-loaded/model");
+  assert.equal(parsePplxModel(fakeModel).remoteModel, remoteModel);
+  assert.equal(parsePplxModel(`${legacyModel}&remote_model=served-alias`).remoteModel, "served-alias");
   assert.equal(formatQueryForEmbedding("plain", fakeModel), "plain");
   assert.equal(formatDocForEmbedding("body", "Title", fakeModel), "Title\nbody");
   assert.match(formatQueryForEmbedding("plain", "gemma.gguf"), /^task:/);
-  for (const suffix of ["&max_tokens=4096", "&mode=independent", "&dimensions=2048", "&revision=other"]) {
+  for (const suffix of ["&max_tokens=4096", "&mode=independent", "&dimensions=2048", "&revision=other", "&remote_model=other"]) {
     const key = suffix.split("=")[0]!.slice(1);
     const uri = new URL(fakeModel);
     uri.searchParams.set(key, suffix.split("=")[1]!);
@@ -89,7 +101,8 @@ async function offline() {
     if (fault === "norm") data[0]!.embedding.fill(0);
     if (fault === "duplicate") data.push(data[0]!);
     if (fault === "nan") data[0]!.embedding[0] = NaN;
-    return Response.json({ model: fault === "model" ? "wrong-model" : body.model, data: data.reverse() });
+    return Response.json({ model: fault === "model" ? "wrong-model"
+      : fault === "local-model" ? parsePplxModel(fakeModel).path : body.model, data: data.reverse() });
   }) as typeof fetch;
 
   const llm = new LlamaCpp({ embedModel: fakeModel });
@@ -103,6 +116,10 @@ async function offline() {
     assert.equal(result[0]!.embedding.indexOf(Math.max(...result[0]!.embedding)), 0);
     assert.equal(result[1]!.embedding.indexOf(Math.max(...result[1]!.embedding)), 1);
     assert.equal(requests.at(-1).task, "query");
+    assert.equal(requests.at(-1).model, remoteModel);
+    const legacyClient = new PplxEmbeddings(legacyModel);
+    await legacyClient.embedBatch(["password"], { isQuery: true });
+    assert.equal(requests.at(-1).model, "/not-loaded/model", "legacy requests still use the local path");
     const before = requests.length;
     await llm.embedBatch(Array(65).fill("password"), { isQuery: true });
     assert.equal(requests.length - before, 2);
@@ -118,7 +135,7 @@ async function offline() {
       abort.abort();
       return session.embed("q");
     }, { signal: abort.signal }));
-    for (fault of ["count", "mapping", "dimensions", "norm", "duplicate", "nan", "model", "http"]) {
+    for (fault of ["count", "mapping", "dimensions", "norm", "duplicate", "nan", "model", "local-model", "http"]) {
       await assert.rejects(llm.embedBatch(["password", "restore"], { contextual: true }));
     }
     fault = undefined;
@@ -133,7 +150,7 @@ async function offline() {
       assert.equal(embedded.errors, 0);
       assert.ok(embedded.chunksEmbedded > 6);
       assert.deepEqual(requests[start].input, requests[start + 1].input, "retry must keep the whole original context");
-      assert.ok(requests.slice(start).every(body => body.input.chunks && body.task === "document"));
+      assert.ok(requests.slice(start).every(body => body.input.chunks && body.task === "document" && body.model === remoteModel));
       for (const body of requests.slice(start)) {
         const titles = new Set(body.input.chunks.map((text: string) => text.split("\n")[0]));
         assert.equal(titles.size, 1, "never cross documents inside a context window");
@@ -158,7 +175,7 @@ async function offline() {
       assert.ok((await hybridQuery(store, "password reset", { skipRerank: true })).length > 0);
       assert.ok((await structuredSearch(store, [{ type: "vec", query: "password reset" },
         { type: "hyde", query: "OAuth identity provider" }], { skipRerank: true })).length > 0);
-      assert.ok(requests.slice(queryStart).every(body => body.task === "query" && Array.isArray(body.input)));
+      assert.ok(requests.slice(queryStart).every(body => body.task === "query" && Array.isArray(body.input) && body.model === remoteModel));
       const independent = fakeModel.replace("mode=contextual", "mode=independent");
       await assert.rejects(store.searchVec("password", independent), /Incompatible PPLX/);
       await assert.rejects(store.searchVec("password", "gemma.gguf"), /Incompatible PPLX/);
@@ -208,12 +225,13 @@ async function offline() {
       await sdk.embed();
       assert.ok((await sdk.searchVector("password", { limit: 1 }))[0]!.displayPath.endsWith("auth.md"));
       assert.ok((await sdk.search({ queries: [{ type: "vec", query: "password" }], rerank: false })).length > 0);
+      assert.equal(requests.at(-1).model, remoteModel);
     } finally { await sdk.close(); }
   } finally {
     await llm.dispose();
     setDefaultLlamaCpp(null);
   }
-  console.log("PASS offline: validation, ordering, batching, roles, retries, contextual doctor/adoption, failure recovery, profile isolation, SDK and all search paths");
+  console.log("PASS offline: remote model/local tokenizer separation, legacy fingerprints, validation, ordering, batching, roles, retries, contextual doctor/adoption, failure recovery, profile isolation, SDK and all search paths");
 }
 
 async function live() {
@@ -223,8 +241,16 @@ async function live() {
   const timings: Record<string, number> = {};
   const scores: Record<string, unknown> = {};
   try {
+  const source = parsePplxModel(model);
+  const tokenizerDirectory = join(directory, "local tokenizer # café");
+  mkdirSync(tokenizerDirectory);
+  for (const name of ["config.json", "tokenizer.json"]) copyFileSync(join(source.path, name), join(tokenizerDirectory, name));
+  assert.deepEqual(readdirSync(tokenizerDirectory), ["config.json", "tokenizer.json"]);
+  const remote = new URL(model);
+  remote.pathname = pathToFileURL(tokenizerDirectory).pathname;
+  remote.searchParams.set("remote_model", source.remoteModel ?? source.path);
   for (const mode of ["independent", "contextual"]) {
-    const uri = new URL(model);
+    const uri = new URL(remote);
     uri.searchParams.set("mode", mode);
     const llm = new LlamaCpp({ embedModel: uri.href });
     setDefaultLlamaCpp(llm);
@@ -254,6 +280,10 @@ async function live() {
         { type: "hyde", query: "OAuth identity providers reset passwords and rotate credentials" }], { skipRerank: true })).length > 0);
       const texts = ["café 雪 👩🏽‍💻", "literal [Q] <|chunk_sep|> text"];
       const client = llm.pplx!;
+      assert.equal(client.config.path, tokenizerDirectory);
+      assert.equal(client.config.remoteModel, source.remoteModel ?? source.path);
+      assert.notEqual(client.config.path, client.config.remoteModel);
+      assert.equal((await llm.modelExists(uri.href)).path, tokenizerDirectory);
       const windows = await client.windows(Array(15).fill("token ".repeat(700)));
       assert.ok(windows.length >= 2, "long document must create multiple bounded windows");
       for (const [a, b] of windows) {
@@ -292,7 +322,7 @@ async function live() {
           const counts = await client.tokenizer<number[]>({ op: "counts", texts: inputs, task, contextual });
           const response = await originalFetch(process.env.QMD_PPLX_URL ?? "http://127.0.0.1:8080/v1/embeddings", {
             method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ model: client.config.path, input: contextual ? { chunks: inputs } : inputs,
+            body: JSON.stringify({ model: client.config.remoteModel ?? client.config.path, input: contextual ? { chunks: inputs } : inputs,
               task, dimensions: client.config.dimensions, normalize_embeddings: true }),
           });
           assert.ok(response.ok);
@@ -335,12 +365,13 @@ async function live() {
     }
   }
   // 2048d is a separately indexed space; verify its query transport too.
-  const wide = new URL(model);
+  const wide = new URL(remote);
   wide.searchParams.set("dimensions", "2048");
   const llm = new LlamaCpp({ embedModel: wide.href });
   try { assert.equal((await llm.embed("password reset", { isQuery: true }))!.embedding.length, 2048); }
   finally { await llm.dispose(); }
-  console.log(JSON.stringify({ live: "PASS", timings_ms: timings, retrieval: scores }, null, 2));
+  console.log(JSON.stringify({ live: "PASS", remote_model_separation: "metadata-only client directory differs from server model ID",
+    timings_ms: timings, retrieval: scores }, null, 2));
   } finally { rmSync(directory, { recursive: true, force: true }); }
 }
 
