@@ -1,5 +1,9 @@
 # QMD - Query Markup Documents
 
+> **PPLX/MLX fork:** Adds contextual PPLX text embeddings through a local MLX
+> server while retaining QMD's GGUF query expansion and reranking.
+> See [setup, usage, verification and limits](docs/PPLX.md).
+
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.

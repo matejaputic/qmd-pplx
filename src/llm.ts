@@ -74,6 +74,7 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
   }
 }
 
+import { isPplxModel, PplxEmbeddings } from "./pplx.js";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
@@ -98,6 +99,7 @@ export function isQwen3EmbeddingModel(modelUri: string): boolean {
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
+  if (isPplxModel(uri)) return query; // MLX adds the learned query prefix.
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
@@ -111,8 +113,8 @@ export function formatQueryForEmbedding(query: string, modelUri?: string): strin
  */
 export function formatDocForEmbedding(text: string, title?: string, modelUri?: string): string {
   const uri = modelUri ?? resolveEmbedModel();
-  if (isQwen3EmbeddingModel(uri)) {
-    // Qwen3-Embedding: documents are raw text, no task prefix
+  if (isPplxModel(uri) || isQwen3EmbeddingModel(uri)) {
+    // PPLX and Qwen3-Embedding: ordinary document content, no task instruction
     return title ? `${title}\n${text}` : text;
   }
   return `title: ${title || "none"} | text: ${text}`;
@@ -206,6 +208,9 @@ export type EmbedOptions = {
   model?: string;
   isQuery?: boolean;
   title?: string;
+  /** Document chunks sharing one PPLX context window (never use for queries). */
+  contextual?: boolean;
+  signal?: AbortSignal;
 };
 
 /**
@@ -531,6 +536,7 @@ export async function pullModels(
 
   const results: PullResult[] = [];
   for (const model of models) {
+    if (isPplxModel(model)) continue; // MLX models are managed by the external server.
     let refreshed = false;
     const hfRef = parseHfUri(model);
     const filename = model.split("/").pop();
@@ -837,6 +843,12 @@ export class LlamaCpp implements LLM {
   private generateModel: LlamaModel | null = null;
   private rerankModel: LlamaModel | null = null;
   private rerankContexts: Awaited<ReturnType<LlamaModel["createRankingContext"]>>[] = [];
+
+  private _pplx: PplxEmbeddings | undefined;
+  get pplx(): PplxEmbeddings | undefined {
+    if (isPplxModel(this.embedModelUri)) this._pplx ??= new PplxEmbeddings(this.embedModelUri);
+    return this._pplx;
+  }
 
   private embedModelUri: string;
   private generateModelUri: string;
@@ -1407,7 +1419,8 @@ export class LlamaCpp implements LLM {
    * Tokenize text using the embedding model's tokenizer
    * Returns tokenizer tokens (opaque type from node-llama-cpp)
    */
-  async tokenize(text: string): Promise<readonly LlamaToken[]> {
+  async tokenize(text: string, signal?: AbortSignal): Promise<readonly LlamaToken[]> {
+    if (this.pplx) return this.pplx.tokenizer<LlamaToken[]>({ op: "encode", text }, signal);
     await this.ensureEmbedContext();  // Ensure model is loaded
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -1427,6 +1440,7 @@ export class LlamaCpp implements LLM {
    * Detokenize token IDs back to text
    */
   async detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    if (this.pplx) return this.pplx.tokenizer<string>({ op: "decode", tokens });
     await this.ensureEmbedContext();
     if (!this.embedModel) {
       throw new Error("Embed model not loaded");
@@ -1471,6 +1485,7 @@ export class LlamaCpp implements LLM {
   }
 
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    if (this.pplx) return (await this.pplx.embedBatch([text], options))[0] ?? null;
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1500,6 +1515,7 @@ export class LlamaCpp implements LLM {
    * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    if (this.pplx) return this.pplx.embedBatch(texts, options);
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1611,6 +1627,10 @@ export class LlamaCpp implements LLM {
   async modelExists(modelUri: string): Promise<ModelInfo> {
     // For HuggingFace URIs, we assume they exist
     // For local paths, check if file exists
+    if (isPplxModel(modelUri)) {
+      const client = new PplxEmbeddings(modelUri);
+      return { name: modelUri, exists: existsSync(join(client.config.path, "tokenizer.json")), path: client.config.path };
+    }
     if (modelUri.startsWith("hf:")) {
       return { name: modelUri, exists: true };
     }
@@ -2069,11 +2089,19 @@ class LLMSession implements ILLMSession {
   }
 
   async embed(text: string, options?: EmbedOptions): Promise<EmbeddingResult | null> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embed(text, options));
+    return this.withOperation(() => {
+      const llm = this.manager.getLlamaCpp();
+      return llm.embed(text, llm.pplx ? { ...options,
+        signal: options?.signal ? AbortSignal.any([this.signal, options.signal]) : this.signal } : options);
+    });
   }
 
   async embedBatch(texts: string[], options?: EmbedOptions): Promise<(EmbeddingResult | null)[]> {
-    return this.withOperation(() => this.manager.getLlamaCpp().embedBatch(texts, options));
+    return this.withOperation(() => {
+      const llm = this.manager.getLlamaCpp();
+      return llm.embedBatch(texts, llm.pplx ? { ...options,
+        signal: options?.signal ? AbortSignal.any([this.signal, options.signal]) : this.signal } : options);
+    });
   }
 
   async expandQuery(

@@ -12,6 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
+import { isPplxModel, parsePplxModel } from "./pplx.js";
 import {
   PartitionWriter,
   VEC_COLLECTION_IDS_TABLE,
@@ -178,7 +179,8 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
     `query:${formatQueryForEmbedding(EMBED_FINGERPRINT_PROBE_QUERY, model)}`,
     `doc:${formatDocForEmbedding(EMBED_FINGERPRINT_PROBE_DOC, EMBED_FINGERPRINT_PROBE_TITLE, model)}`,
     `chunk_tokens:${CHUNK_SIZE_TOKENS}`,
-    `chunk_overlap_tokens:${CHUNK_OVERLAP_TOKENS}`,
+    `chunk_overlap_tokens:${isPplxModel(model) ? 0 : CHUNK_OVERLAP_TOKENS}`,
+    ...(isPplxModel(model) ? [`pplx-profile:v1:${JSON.stringify(parsePplxModel(model))}`] : []),
   ].join("\n");
   return createHash("sha256").update(significant).digest("hex").slice(0, 6);
 }
@@ -2338,11 +2340,21 @@ export async function generateEmbeddings(
   const llm = getLlm(store);
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
   const fingerprint = getEmbeddingFingerprint(model);
+  if ((isPplxModel(model) || llm.pplx) && model !== llm.embedModelName) {
+    throw new Error("Select the PPLX model on the store/LLM, not only embed({ model })");
+  }
+  // ponytail: fixed regex profile; AST support needs a fingerprinted strategy
+  // that doctor and legacy adoption can reproduce as well as indexing.
+  if (llm.pplx && options?.chunkStrategy === "auto") {
+    throw new Error("PPLX currently uses the reproducible regex chunking profile; omit --chunk-strategy auto");
+  }
   const now = new Date().toISOString();
   const { maxDocsPerBatch, maxBatchBytes } = resolveEmbedOptions(options);
   const encoder = new TextEncoder();
 
   if (options?.force) {
+    // Check tokenizer/transport/model before deleting a previously usable index.
+    if (llm.pplx) await llm.embed(EMBED_FINGERPRINT_PROBE_QUERY, { model, isQuery: true });
     clearAllEmbeddings(db, options?.collection);
   }
 
@@ -2370,6 +2382,8 @@ export async function generateEmbeddings(
     const MAX_RETRY_ATTEMPTS = 3;
     const failures = new Map<string, EmbedFailure>();
     const retryQueue = new Map<string, ChunkItem>();
+    const contextual = llm.pplx?.config.mode === "contextual";
+    const contextByChunk = new Map<string, ChunkItem[]>();
     let successesSinceRetry = 0;
 
     const failureList = () => [...failures.values()];
@@ -2397,20 +2411,26 @@ export async function generateEmbeddings(
       retryQueue.delete(key);
     };
     const tryEmbedChunk = async (chunk: ChunkItem): Promise<boolean> => {
+      // A contextual retry must reproduce the whole original window, never an isolated chunk.
+      const group = contextByChunk.get(chunkKey(chunk)) ?? [chunk];
       try {
-        const text = formatDocForEmbedding(chunk.text, chunk.title, embedModelUri);
-        const result = await session.embed(text, { model });
-        if (!result) {
-          recordFailure(chunk, "embedding returned no vector");
-          return false;
-        }
-        insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(result.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-        chunksEmbedded++;
-        successesSinceRetry++;
-        clearFailure(chunk);
+        const texts = group.map(item => formatDocForEmbedding(item.text, item.title, embedModelUri));
+        const results = contextual
+          ? await session.embedBatch(texts, { model, contextual: true })
+          : [await session.embed(texts[0]!, { model })];
+        if (results.length !== group.length || results.some(result => !result)) throw new Error("embedding returned no vector");
+        db.transaction(() => {
+          for (let i = 0; i < group.length; i++) {
+            const item = group[i]!;
+            insertEmbedding(db, item.hash, item.seq, item.pos, new Float32Array(results[i]!.embedding), model, now, item.expectedTotalChunks, fingerprint);
+          }
+        }).immediate();
+        chunksEmbedded += group.length;
+        successesSinceRetry += group.length;
+        for (const item of group) clearFailure(item);
         return true;
       } catch (error) {
-        recordFailure(chunk, reasonFromError(error));
+        for (const item of group) recordFailure(item, reasonFromError(error));
         return false;
       }
     };
@@ -2448,6 +2468,8 @@ export async function generateEmbeddings(
 
       const batchDocs = getEmbeddingDocsForBatch(db, batchMeta);
       const batchChunks: ChunkItem[] = [];
+      const contextGroups: ChunkItem[][] = [];
+      contextByChunk.clear();
       const expectedChunksByHash = new Map<string, number>();
       const batchBytes = batchMeta.reduce((sum, doc) => sum + Math.max(0, doc.bytes), 0);
 
@@ -2464,8 +2486,9 @@ export async function generateEmbeddings(
           session.signal,
         );
 
+        const docChunks: ChunkItem[] = [];
         for (let seq = 0; seq < chunks.length; seq++) {
-          batchChunks.push({
+          docChunks.push({
             hash: doc.hash,
             path: doc.path,
             title,
@@ -2476,6 +2499,15 @@ export async function generateEmbeddings(
             bytes: encoder.encode(chunks[seq]!.text).length,
             expectedTotalChunks: chunks.length,
           });
+        }
+        batchChunks.push(...docChunks);
+        if (contextual) {
+          const texts = docChunks.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
+          for (const [a, b] of await llm.pplx!.windows(texts, session.signal)) {
+            const group = docChunks.slice(a, b);
+            contextGroups.push(group);
+            for (const chunk of group) contextByChunk.set(chunkKey(chunk), group);
+          }
         }
         expectedChunksByHash.set(doc.hash, chunks.length);
       }
@@ -2488,6 +2520,10 @@ export async function generateEmbeddings(
         continue;
       }
 
+      if (!vectorTableInitialized && llm.pplx) {
+        store.ensureVecTable(llm.pplx.config.dimensions);
+        vectorTableInitialized = true;
+      }
       if (!vectorTableInitialized) {
         const firstChunk = batchChunks[0]!;
         const firstText = formatDocForEmbedding(firstChunk.text, firstChunk.title, embedModelUri);
@@ -2502,7 +2538,10 @@ export async function generateEmbeddings(
       const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
       let batchChunkBytesProcessed = 0;
 
-      for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
+      const embeddingBatches = contextual ? contextGroups : Array.from(
+        { length: Math.ceil(batchChunks.length / BATCH_SIZE) }, (_, i) => batchChunks.slice(i * BATCH_SIZE, (i + 1) * BATCH_SIZE));
+      let batchStart = 0;
+      for (const chunkBatch of embeddingBatches) {
         // Abort early if session has been invalidated (e.g. max duration exceeded)
         if (!session.isValid) {
           const remainingChunks = batchChunks.slice(batchStart);
@@ -2520,12 +2559,13 @@ export async function generateEmbeddings(
           break;
         }
 
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
-        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
         try {
-          const embeddings = await session.embedBatch(texts, { model });
+          const embeddings = await session.embedBatch(texts, contextual ? { model, contextual: true } : { model });
+          if (contextual && (embeddings.length !== chunkBatch.length || embeddings.some(item => !item))) {
+            throw new Error("Incomplete contextual window; retry the entire group");
+          }
           // One IMMEDIATE transaction per batch: every chunk writes several
           // rows across three tables, and a kill mid-batch must not leave
           // them out of step. Failure bookkeeping runs after the commit.
@@ -2552,22 +2592,22 @@ export async function generateEmbeddings(
           batchChunkBytesProcessed += chunkBatch.reduce((sum, chunk) => sum + chunk.bytes, 0);
           await retryFailedChunks();
         } catch (error) {
-          // Batch failed — try individual embeddings as fallback. If an
-          // individual retry succeeds, any prior failure for that chunk is
-          // cleared, so the visible error count reflects outstanding failures.
+          // Retry individual inputs, or the entire original contextual window.
+          // Successful retries clear any prior failures for those chunks.
           const batchReason = reasonFromError(error);
           if (!session.isValid) {
             for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
             batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
           } else {
-            for (const chunk of chunkBatch) {
+            for (const chunk of contextual ? chunkBatch.slice(0, 1) : chunkBatch) {
               await tryEmbedChunk(chunk);
-              batchChunkBytesProcessed += chunk.bytes;
               await retryFailedChunks();
             }
+            batchChunkBytesProcessed += chunkBatch.reduce((sum, chunk) => sum + chunk.bytes, 0);
           }
         }
 
+        batchStart += chunkBatch.length;
         const proportionalBytes = totalBatchChunkBytes === 0
           ? batchBytes
           : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
@@ -3060,7 +3100,7 @@ export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: 
       return { checked: true, adopted: 0, reason: `sample chunk ${expectedHashSeq} no longer exists` };
     }
 
-    const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
+    const result = await embedDocumentPassage(llm, session, chunks, title, model, chunk.pos);
     if (!result) {
       return { checked: true, adopted: 0, reason: "failed to embed legacy sample" };
     }
@@ -3847,6 +3887,7 @@ async function chunkDocumentByTokensWithLlm(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
+  if (llm.pplx) overlapTokens = 0;
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
   const avgCharsPerToken = 3;
@@ -3868,7 +3909,7 @@ async function chunkDocumentByTokensWithLlm(
   const pushChunkWithinTokenLimit = async (text: string, pos: number): Promise<void> => {
     if (signal?.aborted) return;
 
-    const tokens = await llm.tokenize(text);
+    const tokens = await llm.tokenize(text, signal);
     if (tokens.length <= maxTokens || text.length <= 1) {
       // Safety net: text.length <= 1 can only legitimately be a single
       // BMP character (a well-formed astral character needs 2 code units),
@@ -3909,6 +3950,7 @@ async function chunkDocumentByTokensWithLlm(
       subChunks.length <= 1
       || subChunks[0]?.text.length === text.length
     ) {
+      if (llm.pplx) throw new Error("PPLX chunking could not make progress without truncation");
       const fallbackTokens = tokens.slice(0, Math.max(1, maxTokens));
       // Safety net: detokenize() reconstructs text from raw token IDs, and
       // a tokenizer can encode a single astral-plane character across
@@ -3933,6 +3975,23 @@ async function chunkDocumentByTokensWithLlm(
   }
 
   return results;
+}
+
+/** Reproduce a saved passage with its original same-document context window. */
+export async function embedDocumentPassage(
+  llm: LlamaCpp, session: ILLMSession, chunks: { text: string; pos: number }[],
+  title: string, model: string, pos: number,
+) {
+  const index = chunks.findIndex(chunk => chunk.pos === pos);
+  if (index < 0) return null;
+  if (llm.pplx?.config.mode === "contextual") {
+    const texts = chunks.map(chunk => formatDocForEmbedding(chunk.text, title, model));
+    const window = (await llm.pplx.windows(texts, session.signal)).find(([a, b]) => a <= index && index < b);
+    if (!window) return null;
+    const [a, b] = window;
+    return (await session.embedBatch(texts.slice(a, b), { model, contextual: true }))[index - a] ?? null;
+  }
+  return session.embed(formatDocForEmbedding(chunks[index]!.text, title, model), { model });
 }
 
 export async function chunkDocumentByTokens(
@@ -4975,6 +5034,15 @@ function nearestVecDocuments(
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
+  // One vec0 table has one embedding space; never search PPLX against stale/foreign vectors.
+  // ponytail: O(n) profile scan per vector lookup; persist an index-level profile
+  // once large-index profiling justifies the schema/migration cost.
+  const stale = db.prepare(`SELECT 1 FROM content_vectors cv
+    WHERE (cv.model != ? OR cv.embed_fingerprint != ?)
+      AND (? OR cv.model LIKE 'pplx:%')
+      AND EXISTS (SELECT 1 FROM documents d WHERE d.hash = cv.hash AND d.active = 1)
+    LIMIT 1`).get(model, getEmbeddingFingerprint(model), Number(isPplxModel(model)));
+  if (stale) throw new Error("Incompatible PPLX embedding profile in this index; use a separate named index or rebuild all collections with qmd embed --force");
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session, llm);
   if (!embedding) return [];
@@ -6354,7 +6422,7 @@ export async function hybridQuery(
     const textsToEmbed = vecQueries.map(q => formatQueryForEmbedding(q.text, embedModel));
     hooks?.onEmbedStart?.(textsToEmbed.length);
     const embedStart = Date.now();
-    const embeddings = await llm.embedBatch(textsToEmbed);
+    const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
     hooks?.onEmbedDone?.(Date.now() - embedStart);
 
     // Run sqlite-vec lookups with pre-computed embeddings
@@ -6756,7 +6824,7 @@ export async function structuredSearch(
       const textsToEmbed = vecSearches.map(s => formatQueryForEmbedding(s.query, embedModel));
       hooks?.onEmbedStart?.(textsToEmbed.length);
       const embedStart = Date.now();
-      const embeddings = await llm.embedBatch(textsToEmbed);
+      const embeddings = await llm.embedBatch(textsToEmbed, { isQuery: true });
       hooks?.onEmbedDone?.(Date.now() - embedStart);
 
       for (let i = 0; i < vecSearches.length; i++) {

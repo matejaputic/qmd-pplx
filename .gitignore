@@ -1,4 +1,5 @@
 node_modules/
+.checks/
 dist/
 package-lock.json
 .npmrc

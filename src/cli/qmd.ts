@@ -1,4 +1,5 @@
 import { isBun, openDatabase } from "../db.js";
+import { isPplxModel, parsePplxModel } from "../pplx.js";
 import type { Database, SQLiteValue } from "../db.js";
 import fastGlob from "fast-glob";
 import { spawn as nodeSpawn } from "child_process";
@@ -37,6 +38,7 @@ import {
   formatDocForEmbedding,
   getEmbeddingFingerprint,
   chunkDocumentByTokens,
+  embedDocumentPassage,
   clearCache,
   getCacheKey,
   getCachedResult,
@@ -4206,6 +4208,11 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (isPplxModel(model)) {
+      const config = parsePplxModel(model);
+      doctorCheck("PPLX tokenizer", existsSync(pathJoin(config.path, "tokenizer.json")), `${config.path}; ${config.dimensions}d, ${config.mode}, ${config.maxTokens} tokens; external MLX server`);
+      continue;
+    }
     unique.set(model, [...(unique.get(model) ?? []), role]);
   }
 
@@ -4274,7 +4281,7 @@ export async function checkEmbeddingVectorSamples(db: Database, model: string, f
       }
 
       const title = extractTitle(sample.body, sample.path);
-      const result = await session.embed(formatDocForEmbedding(chunk.text, title, model), { model });
+      const result = await embedDocumentPassage(getDefaultLlamaCpp(), session, chunks, title, model, chunk.pos);
       if (!result) {
         mismatches.push(`${shortHashSeq(hashSeq)}: embedding failed`);
         continue;
