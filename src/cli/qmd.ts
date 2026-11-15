@@ -4102,7 +4102,9 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
     const raw = process.env[name]?.trim();
     if (!raw) return;
     const configured = configModels[key];
-    const consequence = configured && configured !== raw
+    const consequence = key === "embed" && process.env.QMD_PPLX_MODEL !== undefined
+      ? "ignored because QMD_PPLX_MODEL selects remote embeddings"
+      : configured && configured !== raw
       ? `set but ignored because index models.${key} is configured as ${configured}`
       : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
     overrides.push({ name, value: envValueForDisplay(raw), consequence });
@@ -4112,6 +4114,8 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
   add("QMD_CONFIG_DIR", "overrides the QMD config directory and takes precedence over XDG_CONFIG_HOME");
   add("XDG_CONFIG_HOME", "moves QMD config to $XDG_CONFIG_HOME/qmd when QMD_CONFIG_DIR is not set");
   add("XDG_CACHE_HOME", "moves the default index cache, model cache, and MCP daemon PID files");
+  add("QMD_PPLX_MODEL", "selects remote embeddings, overriding models.embed and QMD_EMBED_MODEL; tokenizer and identity come from the server");
+  add("QMD_PPLX_URL", "sets the PPLX embedding/tokenizer endpoint; restrict access to trusted clients");
   addModel("QMD_EMBED_MODEL", "embed", activeModels.embed);
   addModel("QMD_GENERATE_MODEL", "generate", activeModels.generate);
   addModel("QMD_RERANK_MODEL", "rerank", activeModels.rerank);
@@ -4182,6 +4186,10 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
 
   const notes: string[] = [];
   for (const check of checks) {
+    if (check.key === "embed" && process.env.QMD_PPLX_MODEL !== undefined) {
+      notes.push(`embedding: env QMD_PPLX_MODEL=${process.env.QMD_PPLX_MODEL}; remote tokenizer and automatic model identity`);
+      continue;
+    }
     const envValue = check.envValue?.trim();
     if (envValue && check.active === envValue) {
       notes.push(`${check.role}: env ${check.envName}=${check.active} (default ${check.defaultModel}; might be ok)`);
@@ -4210,7 +4218,7 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   for (const [role, model] of models) {
     if (isPplxModel(model)) {
       const config = parsePplxModel(model);
-      doctorCheck("PPLX tokenizer", existsSync(pathJoin(config.path, "tokenizer.json")), `${config.path}; ${config.dimensions}d, ${config.mode}, ${config.maxTokens} tokens; external MLX server`);
+      doctorCheck("PPLX tokenizer", config.remote || existsSync(pathJoin(config.path, "tokenizer.json")), `${config.remote ? "server-side tokenizer" : config.path}; ${config.dimensions}d, ${config.mode}, ${config.maxTokens} tokens; external MLX server`);
       continue;
     }
     unique.set(model, [...(unique.get(model) ?? []), role]);
@@ -4451,7 +4459,6 @@ async function showDoctor(): Promise<void> {
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
   const embedModel = activeModels.embed;
-  const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 
   console.log(`${c.bold}QMD Doctor${c.reset}\n`);
@@ -4479,7 +4486,6 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
-  checkModelCache(activeModels, nextSteps);
 
   await runDoctorDeviceChecks(nextSteps);
 
@@ -4491,6 +4497,9 @@ async function showDoctor(): Promise<void> {
   } catch (error) {
     doctorCheck("legacy fingerprint adoption", false, error instanceof Error ? error.message : String(error));
   }
+  // Adoption refreshes remote metadata even when no legacy vectors exist.
+  const fingerprint = getEmbeddingFingerprint(embedModel);
+  checkModelCache(activeModels, nextSteps);
 
   try {
     const pending = getHashesNeedingEmbedding(db, undefined, embedModel);

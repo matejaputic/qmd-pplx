@@ -1,315 +1,181 @@
 # PPLX embeddings through MLX
 
-This fork adds **text embeddings** from `perplexity-ai/pplx-embed-v2-context-9b`
-served by an MLX embedding server. QMD keeps its existing SQLite/BM25/vector
-retrieval, query expansion, RRF fusion, metadata filters, and GGUF reranker.
-The upstream GGUF embedding backend is unchanged when a `pplx:` model is not selected.
+## Client setup: two variables
 
-## Prerequisites
+Update this fork (`git pull --ff-only && bun run build` for a source checkout),
+then set these on the **QMD client**:
 
-- This fork, not the upstream `@tobilu/qmd` package.
-- An MLX conversion of the **non-preview** PPLX model with its matching
-  `config.json` and `tokenizer.json` beside the weights.
-- `mlx_vlm.server` with the PPLX model adapter and extended embedding endpoint.
-  **Vanilla mlx-vlm without that adapter is not sufficient.** On the machine this
-  integration was developed for, that installation already exists; its conversion,
-  server patch, parity checks, and examples are in `~/Projects/pplx-embed-mlx/README.md`.
-- Python with `tokenizers`, already included in that mlx-vlm environment.
-  No new Python or JavaScript dependencies are introduced by this backend.
+```bash
+export QMD_PPLX_URL="http://192.168.30.205/v1/embeddings"
+export QMD_PPLX_MODEL="/Users/macos/models/pplx-embed-v2-context-9b-MLX-8bit"
+```
 
-QMD sends text to the configured endpoint. Prefer loopback plus an SSH tunnel
-for remote access. If binding to a LAN interface, restrict access to trusted
-clients with a firewall; the service is unauthenticated. Do not expose it to the
-public Internet. Changing the endpoint is an explicit data-routing decision,
-not an automatic fallback.
+That is all the embedding configuration required. `QMD_PPLX_MODEL` is the exact
+model ID listed by the host's `GET /v1/models`, not a client-local filesystem path.
+The client needs **no revision string, model weights, tokenizer files, Python,
+or MLX installation**. Do not copy any model files to the client.
 
-## Setup on the existing machine
+Use the fork's executable (shown as `qmd` below), not upstream `@tobilu/qmd`:
+
+```bash
+# Run these yourself when ready to index your own collection.
+qmd --index pplx collection add ~/notes --name notes
+qmd --index pplx update
+qmd --index pplx embed
+qmd --index pplx vsearch "How do I configure authentication?"
+qmd --index pplx query "How do I configure authentication?"
+qmd --index pplx doctor
+```
+
+For the local checkout, the executable is `~/Projects/qmd-pplx/bin/qmd`.
+A fresh named index leaves an existing working index untouched. If replacing an
+existing embedding profile, rebuild **all collections** once with
+`qmd --index pplx embed --force`; incompatible vectors are never silently mixed.
+
+**Environment precedence:** `QMD_PPLX_MODEL` plus `QMD_PPLX_URL` explicitly select
+remote PPLX embeddings, overriding saved `models.embed` and `QMD_EMBED_MODEL`.
+There is no need to edit an index YAML or construct a `pplx:` URI. Unset
+`QMD_PPLX_MODEL` to return to normal QMD model selection.
+
+Only embedding inference and tokenization run on the server. QMD's database,
+BM25, query expansion and reranking remain on the client. `vsearch` needs no
+client-side GGUF models; `query` uses QMD's existing GGUF expansion/reranking
+models and their normal platform requirements. `pull` skips the remote embedding
+model and manages only GGUF models.
+
+## Server prerequisite (already installed on this machine)
+
+The host must run the patched **`mlx_vlm.server`**, with the PPLX contextual
+adapter and QMD remote-tokenizer support. An unmodified OpenAI-compatible
+embedding endpoint is not sufficient for contextual encoding and exact budgeting.
+
+The existing conversion, base server patch and model adapter are documented at
+`~/Projects/pplx-embed-mlx/README.md`. To add/update the QMD server extension,
+stop the server, then run this **on the host using the server's Python**:
 
 ```bash
 cd ~/Projects/qmd-pplx
-bun install
-bun run build
+~/.local/share/uv/tools/mlx-vlm/bin/python scripts/install-pplx-server.py
 ```
 
-Start the existing PPLX server in another terminal:
+The installer is repeatable, checks compatibility before editing, and preserves
+`embeddings.py.qmd-backup`. It installs the shared tokenizer helper into the
+server environment. Re-run it after upgrading mlx-vlm or this extension.
+The base PPLX model adapter/basic embedding patch must already be installed.
 
-```bash
-~/Projects/pplx-embed-mlx/serve.sh
-```
-
-Or use the server executable directly:
+Start the host's service, using an appropriate trusted interface and port:
 
 ```bash
 ~/.local/bin/mlx_vlm.server \
   --embedding-model "$HOME/models/pplx-embed-v2-context-9b-MLX-8bit" \
-  --host 127.0.0.1 --port 8080
+  --host 192.168.30.205 --port 8080
 ```
 
-Configure the QMD process:
+The client's URL must match the reachable service URL. The example client URL
+uses HTTP's default port 80: a reverse proxy must forward that address to the
+server, or use `http://192.168.30.205:8080/v1/embeddings` for direct access.
+No proxy or firewall configuration is installed automatically.
+
+The service is **unauthenticated**. Restrict LAN access to trusted clients; do
+not expose it to the public Internet. Prefer an SSH tunnel on untrusted networks:
 
 ```bash
-export QMD_PPLX_PYTHON="$HOME/.local/share/uv/tools/mlx-vlm/bin/python"
-export QMD_PPLX_URL="http://127.0.0.1:8080/v1/embeddings"
-export QMD_EMBED_MODEL="pplx:$HOME/models/pplx-embed-v2-context-9b-MLX-8bit?revision=dab89ff203fc943c4ca16e51c5882ff92790d758-q8&dimensions=1024&mode=contextual&max_tokens=8192"
+# Host server stays bound to 127.0.0.1:8080.
+# Run on the client in a separate terminal:
+ssh -N -L 18080:127.0.0.1:8080 macos@192.168.30.205
+
+# In the QMD client's terminal:
+export QMD_PPLX_URL="http://127.0.0.1:18080/v1/embeddings"
 ```
 
-Use a **new named index**, leaving your previous QMD index untouched:
+`QMD_PPLX_MODEL` remains the host's model ID, unchanged by the tunnel.
 
-```bash
-# Run these yourself when ready to index your collection.
-~/Projects/qmd-pplx/bin/qmd --index pplx collection add ~/notes --name notes
-~/Projects/qmd-pplx/bin/qmd --index pplx update
-~/Projects/qmd-pplx/bin/qmd --index pplx embed
-~/Projects/qmd-pplx/bin/qmd --index pplx vsearch "How do I configure authentication?"
-~/Projects/qmd-pplx/bin/qmd --index pplx query "How do I configure authentication?"
-~/Projects/qmd-pplx/bin/qmd --index pplx doctor
-```
+## Automatic identity and exact tokenization
 
-Use the fork's executable explicitly; installing upstream with
-`npm install -g @tobilu/qmd` will not install these changes. No global executable
-or existing personal collection was replaced during development.
+QMD handles the details internally:
 
-`vsearch` needs only the running embedding server. `query` additionally uses
-QMD's original GGUF expansion and reranking models. `pull` downloads those
-GGUF models but skips `pplx:` entries: MLX weights are managed outside QMD.
+- Query encoding uses `task: "query"`; document encoding uses `task: "document"`.
+  Learned model prefixes are added exactly once by the host.
+- Default output is **1024-dimensional, normalized** embeddings.
+- Markdown-aware chunks have a **900-token ceiling and zero overlap**.
+- Consecutive chunks from one document share bounded contextual windows; unrelated
+  documents never share context.
+- The host's actual tokenizer counts prefixes, separators, titles and text.
+  It supplies the validated context ceiling, at most **8192 tokens**.
+- Tokenization/metadata use the **same configured embedding URL**, so reverse
+  proxies do not need additional routes.
+- On the first metadata request after loading a model, the host hashes its actual
+  weights, tokenizer, config, PPLX adapter and tokenizer-service code. This may take several seconds;
+  the result is reused for that loaded model.
+- QMD automatically caches only the small identity/limit metadata under
+  `$XDG_CACHE_HOME/qmd/pplx/` (normally `~/.cache/qmd/pplx/`). No tokenizer is
+  downloaded and no client-side subprocess is run.
+- Each client process refreshes metadata before embedding/search. Token operations
+  and embedding requests include the expected identity; a changed host model is
+  rejected instead of silently contaminating an index.
 
-### Existing named indexes and configuration precedence
+Restart QMD after changing/reloading the host model, then rebuild affected
+embeddings. The client never needs to know or supply a revision. Offline status
+uses the last cached identity; it is not a live server-health check.
 
-QMD's `models.embed` in an index's YAML **takes precedence over**
-`QMD_EMBED_MODEL`. The environment variable selects the initial model for a
-new index; it does not override a model already saved in that index.
+Profiles are conservatively scoped to the selected endpoint/model/settings.
+Changing the endpoint/model selection is treated as a different index profile;
+use a separate named index or rebuild. Matching weights at two endpoints are not
+an automatic index-migration mechanism.
 
-For an existing named index, set the actual absolute path in its YAML, for example
-`~/.config/qmd/pplx.yml`:
+Window writes are transactional. Failed contextual windows are retried together,
+never as isolated chunks. Incomplete documents remain pending, and a force
+rebuild checks the service before deleting existing vectors. HTTP failures,
+invalid metadata/mappings/dimensions/nonfinite vectors, stale identities and
+oversized inputs fail explicitly. There is no fallback model or silent truncation.
 
-```yaml
-models:
-  embed: "pplx:/Users/YOU/models/pplx-embed-v2-context-9b-MLX-8bit?revision=dab89ff203fc943c4ca16e51c5882ff92790d758-q8&dimensions=1024&mode=contextual&max_tokens=8192"
-```
-
-YAML values do not expand `$HOME` or `~`. Leave `generate` and `rerank` unchanged.
-Normal QMD project-local configuration trust rules still apply.
-
-## Remote server, local tokenizer
-
-The QMD client does **not** need MLX or the model weights. It needs Python with
-`tokenizers` and matching `config.json` / `tokenizer.json` files. The URI path
-is the **client-local tokenizer directory**; optional `remote_model` is the
-**server's model ID**, sent in the HTTP request and checked in the response.
-They can be completely different paths (or the remote ID can be a served alias).
-
-First update the fork on the client (`git pull --ff-only && bun run build` for a
-source checkout). On the embedding host, keep the patched MLX server running.
-For direct LAN access, start it with `--host <HOST_LAN_IP>` instead of localhost
-and allow port 8080 only from trusted clients.
-
-On the client, replace the example host/address and use the exact remote ID
-reported by the host's `/v1/models` endpoint:
-
-```bash
-SERVER="macos@192.168.1.100"
-REMOTE_MODEL="/Users/macos/models/pplx-embed-v2-context-9b-MLX-8bit"
-TOKENIZER_DIR="$HOME/.local/share/qmd/pplx-tokenizer"
-
-mkdir -p "$TOKENIZER_DIR"
-scp "${SERVER}:${REMOTE_MODEL}/config.json" "$TOKENIZER_DIR/"
-scp "${SERVER}:${REMOTE_MODEL}/tokenizer.json" "$TOKENIZER_DIR/"
-
-# CLIENT-side Python with tokenizers installed; no MLX installation needed.
-export QMD_PPLX_PYTHON="/absolute/path/to/client/python"
-export QMD_PPLX_URL="http://192.168.1.100:8080/v1/embeddings"
-export QMD_EMBED_MODEL="pplx:$TOKENIZER_DIR?revision=dab89ff203fc943c4ca16e51c5882ff92790d758-q8&remote_model=$REMOTE_MODEL&dimensions=1024&mode=contextual&max_tokens=8192"
-```
-
-If the client has no Python environment with `tokenizers`, create one:
-
-```bash
-python3 -m venv "$HOME/.venvs/qmd-pplx"
-"$HOME/.venvs/qmd-pplx/bin/python" -m pip install tokenizers
-export QMD_PPLX_PYTHON="$HOME/.venvs/qmd-pplx/bin/python"
-```
-
-For an SSH tunnel instead of exposing the service on the LAN, leave the server
-bound to `127.0.0.1:8080`, run this in a separate client terminal:
-
-```bash
-ssh -N -L 18080:127.0.0.1:8080 macos@192.168.1.100
-```
-
-Then use `QMD_PPLX_URL=http://127.0.0.1:18080/v1/embeddings`. The `remote_model`
-value is unchanged: it identifies the model on the server, not the tunnel.
-
-For an existing named index, update its YAML `models.embed`, not just the
-environment variable. For example, on a Linux client with user `alice`:
-
-```yaml
-models:
-  embed: "pplx:/home/alice/.local/share/qmd/pplx-tokenizer?revision=dab89ff203fc943c4ca16e51c5882ff92790d758-q8&remote_model=/Users/macos/models/pplx-embed-v2-context-9b-MLX-8bit&dimensions=1024&mode=contextual&max_tokens=8192"
-```
-
-Use the normal named-index workflow above. Only embedding inference runs on the
-server; the database, tokenization, GGUF query expansion and reranking remain on
-the QMD client. Native expansion/reranking support still depends on the client's
-platform; `vsearch` needs no client-side GGUF models.
-
-Without `remote_model`, the existing behavior and fingerprints are unchanged:
-the URI path is used both locally and as the HTTP model ID. Adding/changing
-`remote_model` (or moving the local tokenizer directory) changes the embedding
-profile; use a fresh named index or rebuild all collections once with `embed --force`.
-Keep the tokenizer metadata synchronized with the hosted weights/revision.
-
-## Model URI and transport settings
-
-```text
-pplx:/absolute/local/tokenizer/directory?revision=WEIGHTS-AND-TOKENIZER-ID&remote_model=SERVER-MODEL-ID&dimensions=1024&mode=contextual&max_tokens=8192
-```
-
-| URI parameter | Values | Default |
-| --- | --- | --- |
-| `revision` | Required nonempty identifier; change whenever weights/tokenizer change | None |
-| `remote_model` | Optional nonempty server model ID; no control characters | URI's local directory path |
-| `dimensions` | `1024`, `2048` | `1024` |
-| `mode` | `independent`, `contextual` | `contextual` |
-| `max_tokens` | Integer from `1024` through `8192` | `8192` |
-
-Unknown/duplicate parameters are rejected. Percent-encode reserved characters in
-paths (notably `?` and `#`) and query values (notably `&`, `#`, `%` and `+`).
-The server ID in the example contains only path-safe characters; use
-`URLSearchParams.set("remote_model", id)` when building URIs for arbitrary IDs.
-`revision` is an index identity supplied by you,
-**not a download instruction or automatic cryptographic verification of weights**.
-Use a new revision when replacing files in place.
-
-Transport-only environment variables:
-
-- `QMD_PPLX_URL`: complete embedding endpoint; defaults to
-  `http://127.0.0.1:8080/v1/embeddings`.
-- `QMD_PPLX_PYTHON`: executable with `tokenizers`; defaults to `python3`.
-
-Vectors are always normalized. Indexing and queries use the same dimensions.
-HTTP requests time out after 180 seconds; tokenizer calls after 60 seconds.
-HTTP errors, incorrect model/vector counts, invalid dimensions, nonfinite or
-non-unit vectors, and inconsistent response mappings fail explicitly. There is
-no fallback to another embedding model and no silent truncation.
-
-## What contextual indexing does
-
-1. Use QMD's Markdown-aware regex boundaries, with a **900-token ceiling and
-   zero overlap**, verified using this model's tokenizer.
-2. Keep the title as ordinary text (`title + newline + passage`), without
-   EmbeddingGemma or Qwen instruction prefixes.
-3. Greedily pack consecutive chunks from **one document** into windows.
-4. Count the exact encoded document prefix, separators, titles and text when
-   enforcing `max_tokens`. Match this ceiling to the server's configured limit.
-5. Submit `{"input":{"chunks":[...]},"task":"document",...}` and store one
-   vector per chunk, preserving QMD's original hash, sequence and character offset.
-6. Retry an entire failed contextual window, never a chunk in isolation.
-   Window writes are transactional; incomplete documents are not treated as
-   successfully embedded.
-
-A top-level list of strings means **independent** embeddings, not shared context.
-That is what `mode=independent` uses for documents. Both profiles use the same
-non-overlapping chunker, making them useful for an initial controlled comparison.
-
-Queries always use `task: "query"`, including expanded/HyDE queries in hybrid
-and structured search. Query strings are not joined into a document context.
-The MLX adapter adds the learned PPLX prefixes exactly once.
-
-`doctor` and legacy-fingerprint adoption reconstruct the same document windows
-when reproducing stored vectors. A force rebuild checks the tokenizer and
-embedding service before clearing existing embeddings.
-
-### Index identity and rebuilding
-
-The embedding fingerprint includes the model URI, resolved dimensions/context
-mode/budget/revision, formatting, zero-overlap policy and a backend profile version.
-Vector search rejects incompatible active profiles, including native-vs-PPLX
-vectors, rather than comparing unrelated embedding spaces.
-
-Use **one embedding profile per named index**. To compare profiles, use separate
-indexes. To intentionally replace a profile in place, edit `models.embed`, then
-rebuild **all collections** with:
-
-```bash
-~/Projects/qmd-pplx/bin/qmd --index pplx embed --force
-```
-
-Changing only the endpoint is safe only if it serves identical weights/tokenizer.
-Changing dimensions, weights, tokenizer, formatting, chunking or grouping requires
-a rebuild. Partial collection rebuilds must not be used to mix profiles.
+`doctor` reproduces the same context windows when checking saved vectors and
+reports a **server-side tokenizer**, not missing local files.
 
 ## SDK
 
-The same backend is used by SDK vector and hybrid/structured search:
+Set the same two environment variables before creating a store. No embedding
+configuration object is required, even if an old config specifies a GGUF model:
 
 ```typescript
 import { createStore } from "./dist/index.js";
 
-const store = await createStore({
-  dbPath: "/absolute/path/to/pplx.sqlite",
-  config: {
-    models: { embed: process.env.QMD_EMBED_MODEL! },
-    collections: { notes: { path: "/absolute/path/to/notes", pattern: "**/*.md" } },
-  },
-});
+const store = await createStore({ dbPath: "/absolute/path/to/pplx.sqlite" });
 try {
-  await store.update();
-  await store.embed();
   console.log(await store.searchVector("How do I reset my password?"));
-  console.log(await store.search({
-    queries: [{ type: "vec", query: "OAuth credential rotation" }],
-    rerank: false,
-  }));
 } finally {
   await store.close();
 }
 ```
 
-Set the embedding model on the store/LLM. Supplying a different `model` only to
-`store.embed()` is rejected for PPLX: that would otherwise mislabel the vectors.
+The store must already contain indexed/embedded documents; normal SDK collection,
+update and embed methods are unchanged.
 
 ## Verification
 
-Fast assert-based checks using generated in-memory documents and an intercepted
-transport (no server, tokenizer/model download, personal config or personal index):
+Fast assert-based checks; no service, weights, Python or test framework required:
 
 ```bash
-bun scripts/check-pplx.ts
-# Also verified on Node:
+bun run test:pplx
 node --import tsx scripts/check-pplx.ts
 ```
 
-With the real MLX server running and the environment above:
+With the server running, test the actual two-variable setup against temporary
+indexes (nothing touches personal collections):
 
 ```bash
-export QMD_PPLX_TEST_MODEL="$QMD_EMBED_MODEL"
-bun scripts/check-pplx.ts --live
+export QMD_PPLX_URL="http://127.0.0.1:8080/v1/embeddings"
+export QMD_PPLX_MODEL="/Users/macos/models/pplx-embed-v2-context-9b-MLX-8bit"
+GGML_METAL_NO_RESIDENCY=1 bun scripts/check-pplx.ts --remote-live
 ```
 
-To also exercise **real GGUF query expansion and reranking** rather than only the
-PPLX vector and pre-expanded structured paths, first ensure QMD's default
-GGUF generation/reranking weights are cached, then:
+This deliberately points `QMD_PPLX_PYTHON` at a nonexistent executable and uses
+no local model/tokenizer files. It checks SDK indexing, expected top documents,
+Unicode tokenization, source/built CLI JSON vector search, `doctor`, invalid
+requests, and rejection of an incorrect model fingerprint. Saved GGUF model
+settings are deliberately present to verify environment precedence.
 
-```bash
-GGML_METAL_NO_RESIDENCY=1 QMD_PPLX_CHECK_NATIVE=1 \
-  bun scripts/check-pplx.ts --live
-```
-
-The live check builds and deletes temporary indexes, tests both document modes,
-real multi-window indexing, sampled vector reproduction, oversized-input rejection,
-1024/2048-dimensional queries, Unicode tokenization, and source/built CLI JSON
-search plus `doctor`. Native-model checks may download their default GGUF weights
-if not already cached. They do not select a GGUF embedding model.
-
-The offline check covers validation, 64-item request batching, response ordering,
-query-role routing, contextual retry preservation, failure recovery, profile
-isolation, SDK calls, all three search paths, remote-ID routing/response checks,
-and unchanged fingerprints for legacy URIs. The live check copies only the two
-metadata files into a separate temporary client directory (including spaces,
-Unicode and `#` in its path), then uses `remote_model` for all server requests,
-including source/built CLI search and `doctor`.
-
-Upstream regression commands:
+Upstream regression checks:
 
 ```bash
 bun run build
@@ -317,61 +183,43 @@ bun run lint
 bun run test:types
 CI=true GGML_METAL_NO_RESIDENCY=1 bun test --timeout 60000 \
   --preload ./src/test-preload.ts test/
-CI=true GGML_METAL_NO_RESIDENCY=1 bun run test:node
 ```
 
-On a machine whose global `init.templateDir` is empty, upstream release-script
-tests need Git's stock templates. For that command only, prefix:
+On this machine, the unrelated upstream release tests need stock Git templates
+because global `init.templateDir` is empty. Prefix only that command with
+`GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.templateDir
+GIT_CONFIG_VALUE_0=/opt/homebrew/share/git-core/templates`; no global Git settings
+need changing. Full Bun regression: **1529 passed / 89 skipped**. Targeted Node
+embedding/store/SDK/doctor/structured-search regression: **540 passed / 50 skipped**.
 
-```bash
-GIT_CONFIG_COUNT=1 \
-GIT_CONFIG_KEY_0=init.templateDir \
-GIT_CONFIG_VALUE_0=/opt/homebrew/share/git-core/templates \
-CI=true GGML_METAL_NO_RESIDENCY=1 bun test --timeout 60000 \
-  --preload ./src/test-preload.ts test/
-```
+These are correctness checks, not evidence that PPLX beats QMD's default
+embedding model on your collection. Evaluate representative queries yourself.
 
-This avoids changing global Git configuration or unrelated upstream tests.
+## Legacy / advanced local-tokenizer mode
 
-### Results on the development machine
+Existing `QMD_EMBED_MODEL=pplx:/local/tokenizer/path?...` URIs remain supported
+when `QMD_PPLX_MODEL` is **unset**. Their fingerprints are unchanged. Only this
+legacy mode needs local `config.json`, `tokenizer.json` and a Python executable
+with `tokenizers` (`QMD_PPLX_PYTHON`, default `python3`).
 
-- Full upstream suites: **1529 passed / 89 skipped on Bun**;
-  **1533 passed / 81 skipped on Node/Vitest**, with the command-scoped Git override.
-- Tokenizer IDs match Transformers `AutoTokenizer` on Unicode, literal special
-  tokens, NUL, whitespace, and contextual document-prefix/separator inputs.
-- Initial three-topic retrieval checks: **3/3 expected top documents** for both
-  independent and contextual 1024-dimensional indexing.
-- A long document produced **36 chunks across 2 context windows**; its last-window
-  vector reproduced the stored vector within `1e-6` per component.
-- Exact query/independent/contextual token counts match the server's reported usage.
-- Real GGUF expansion produced **4 subqueries**; hybrid reranking ranked the backup
-  document first, and structured reranking ranked the gardening document first.
-- Source and built CLI JSON vector search and contextual `doctor` passed. Live
-  checks passed under both Bun and Node.
-- Remote-ID separation passed live with a metadata-only client directory different
-  from the server model path, including multi-window indexing, diagnostics and CLI.
-  Legacy URI fingerprints remain unchanged.
+Its optional URI parameters remain `revision` (required in legacy mode),
+`remote_model` (defaults to the local path), `dimensions` (`1024`/`2048`),
+`mode` (`contextual`/`independent`) and `max_tokens` (`1024`–`8192`). Unknown or
+duplicate keys are rejected. Percent-encode reserved characters in paths and
+query values; use `URLSearchParams` when constructing arbitrary IDs.
 
-These are correctness/smoke checks, **not evidence that PPLX beats QMD's default
-model on your collection**. Evaluate your own queries before replacing a working
-index. Initial tiny-corpus indexing took roughly 2.5s independent / 3.3s contextual;
-that is not a throughput benchmark.
+Do not configure this URI for the normal remote setup: **URL + MODEL replaces it**.
 
 ## Deliberate limits
 
-- **Text only in QMD.** The MLX server can embed images/pages, but this fork does
-  not add PDF rendering, image ingestion, visual-band storage or page-result mapping.
-  Convert documents to Markdown for QMD, or use a separate visual retrieval index.
-  Markdown image links do not cause their pixels to be embedded.
-- **Regex chunking profile.** PPLX indexing rejects `--chunk-strategy auto` rather
-  than allowing AST boundaries that its fingerprint/diagnostics cannot reproduce.
-  Existing GGUF AST support is unchanged.
-- **8192-token validated ceiling**, not the advertised 262144-token model maximum.
-  Long documents are split into bounded context windows; no cross-window context.
-- A lightweight tokenizer subprocess per call (~0.2s locally). A persistent
-  tokenizer worker is the upgrade path if this dominates large-corpus indexing.
-- An O(n) compatibility scan per vector lookup. Persisting an index-level profile
-  is the upgrade path if profiling shows this matters on large indexes.
-- The server-side inference lock bounds memory; concurrent client requests queue
-  rather than performing parallel model inference.
-- No boot/login service is installed. Start the server explicitly when needed.
+- Text only in QMD: no PDF rendering, image ingestion, visual-band storage or
+  page-result mapping. Markdown image links do not embed pixels.
+- PPLX indexing uses the reproducible regex profile; `--chunk-strategy auto` is
+  rejected. GGUF AST support remains unchanged.
+- At most 8192 tokens per shared window, not the advertised 262144-token model
+  maximum. No cross-window context.
+- The encoder lock serializes tokenization and inference to bound memory and
+  protect tokenizer state. Remote tokenization adds LAN round trips.
+- Compatibility checks currently scan active vectors, O(n) per vector lookup.
+  Persisting an index-level profile is the upgrade path if profiling warrants it.
+- No boot/login service or public network exposure is installed automatically.

@@ -12,7 +12,7 @@
  */
 
 import { openDatabase, loadSqliteVec } from "./db.js";
-import { isPplxModel, parsePplxModel } from "./pplx.js";
+import { isPplxModel, parsePplxModel, preparePplxModel } from "./pplx.js";
 import {
   PartitionWriter,
   VEC_COLLECTION_IDS_TABLE,
@@ -2338,6 +2338,7 @@ export async function generateEmbeddings(
 ): Promise<EmbedResult> {
   const db = store.db;
   const llm = getLlm(store);
+  await llm.pplx?.prepare();
   const model = options?.model ?? llm.embedModelName ?? DEFAULT_EMBED_MODEL;
   const fingerprint = getEmbeddingFingerprint(model);
   if ((isPplxModel(model) || llm.pplx) && model !== llm.embedModelName) {
@@ -3028,6 +3029,7 @@ export type LegacyFingerprintAdoptionResult = {
 };
 
 export async function maybeAdoptLegacyEmbeddingFingerprint(store: Store, model: string = DEFAULT_EMBED_MODEL): Promise<LegacyFingerprintAdoptionResult> {
+  await preparePplxModel(model);
   const db = store.db;
   const fingerprint = getEmbeddingFingerprint(model);
   const legacyCount = withLazyContentVectorMigration(db, () => {
@@ -5034,6 +5036,7 @@ function nearestVecDocuments(
 
 export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string | readonly string[], session?: ILLMSession, precomputedEmbedding?: number[], llm?: LlamaCpp, filter?: MetadataFilter): Promise<SearchResult[]> {
   if (!hasVectorIndex(db)) return [];
+  await preparePplxModel(model);
   // One vec0 table has one embedding space; never search PPLX against stale/foreign vectors.
   // ponytail: O(n) profile scan per vector lookup; persist an index-level profile
   // once large-index profiling justifies the schema/migration cost.

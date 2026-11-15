@@ -13,6 +13,11 @@
 
 ### Added
 
+- Two-variable remote PPLX setup: `QMD_PPLX_URL` + `QMD_PPLX_MODEL` override
+  saved embedding settings. Exact tokenization and automatic artifact identity
+  run on the MLX host; clients need no Python, tokenizer files, or revision.
+  Adds a repeatable host-extension installer, offline and live checks, and a
+  simplified setup guide; existing explicit PPLX URIs remain compatible.
 - Optional `remote_model` in PPLX model URIs separates the server's model ID
   from the client-local tokenizer directory. Existing URIs/fingerprints remain
   unchanged; remote clients need only tokenizer metadata, not MLX weights.

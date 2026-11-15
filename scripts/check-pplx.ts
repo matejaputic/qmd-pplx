@@ -1,5 +1,5 @@
-// Run: bun scripts/check-pplx.ts [--live]
-// No framework, no production index. --live requires QMD_PPLX_TEST_MODEL and a running MLX server.
+// Run: bun scripts/check-pplx.ts [--remote-live | --live]
+// Temporary indexes only. --remote-live uses URL + MODEL; --live checks legacy URIs.
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, copyFileSync, readdirSync } from "node:fs";
@@ -8,9 +8,9 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PplxEmbeddings, parsePplxModel } from "../src/pplx.js";
+import { PplxEmbeddings, parsePplxModel, pplxModelFromEnv } from "../src/pplx.js";
 import { LlamaCpp, formatDocForEmbedding, formatQueryForEmbedding, setDefaultLlamaCpp,
-  withLLMSessionForLlm } from "../src/llm.js";
+  withLLMSessionForLlm, resolveEmbedModel } from "../src/llm.js";
 import { createStore, generateEmbeddings, chunkDocumentByTokens, getEmbeddingFingerprint,
   hashContent, hybridQuery, structuredSearch, maybeAdoptLegacyEmbeddingFingerprint, embedDocumentPassage } from "../src/store.js";
 import { checkEmbeddingVectorSamples } from "../src/cli/qmd.js";
@@ -23,6 +23,8 @@ const fakeModel = `${legacyModel}&remote_model=${encodeURIComponent(remoteModel)
 const originalFetch = globalThis.fetch;
 const originalTokenizer = PplxEmbeddings.prototype.tokenizer;
 const originalUrl = process.env.QMD_PPLX_URL;
+const originalModel = process.env.QMD_PPLX_MODEL;
+let serverFingerprint = "a".repeat(64);
 const requests: any[] = [];
 let fault: string | undefined;
 let transientFailures = 0;
@@ -52,6 +54,7 @@ async function addDocs(store: ReturnType<typeof createStore>, long = true) {
 }
 
 async function offline() {
+  delete process.env.QMD_PPLX_MODEL;
   process.env.QMD_PPLX_URL = "http://127.0.0.1:8080/v1/embeddings";
   for (const invalid of ["pplx:relative?revision=x", "pplx://host/path?revision=x", "pplx:/path",
     "pplx:/path?revision=x&dimensions=768", "pplx:/path?revision=x&mode=oops",
@@ -85,11 +88,21 @@ async function offline() {
     return (request.contextual ? [request.texts.join("").length + 10]
       : request.texts.map(text => text.length + 10)) as T;
   };
+  const mockTokenizer = PplxEmbeddings.prototype.tokenizer;
   globalThis.fetch = (async (_url, options) => {
     const body = JSON.parse(options!.body as string);
     requests.push(body);
     options?.signal?.throwIfAborted();
     if (fault === "http" || transientFailures-- > 0) return new Response("temporarily unavailable", { status: 503 });
+    if (body.expected_fingerprint && body.expected_fingerprint !== serverFingerprint) return new Response("model changed", { status: 400 });
+    if (body.tokenizer) {
+      const result = body.tokenizer.op === "info"
+        ? { fingerprint: fault === "bad-info" ? "invalid" : serverFingerprint, maxTokens: 8192 }
+        : fault === "bad-tokenizer"
+          ? (body.tokenizer.op === "decode" ? 0 : body.tokenizer.op === "windows" ? [[1, 2]] : [null])
+          : await mockTokenizer.call(null, body.tokenizer);
+      return Response.json({ model: body.model, fingerprint: serverFingerprint, result });
+    }
     const contextual = !Array.isArray(body.input);
     const texts: string[] = contextual ? body.input.chunks : body.input;
     const data = texts.map((text, index) => ({ index, input_index: contextual ? 0 : index,
@@ -231,7 +244,67 @@ async function offline() {
     await llm.dispose();
     setDefaultLlamaCpp(null);
   }
-  console.log("PASS offline: remote model/local tokenizer separation, legacy fingerprints, validation, ordering, batching, roles, retries, contextual doctor/adoption, failure recovery, profile isolation, SDK and all search paths");
+  // The normal client setup is exactly URL + MODEL, no URI/files/Python/revision.
+  PplxEmbeddings.prototype.tokenizer = originalTokenizer;
+  const cache = mkdtempSync(join(tmpdir(), "qmd-pplx-remote-"));
+  const oldCache = process.env.XDG_CACHE_HOME;
+  const oldPython = process.env.QMD_PPLX_PYTHON;
+  const oldEmbed = process.env.QMD_EMBED_MODEL;
+  process.env.XDG_CACHE_HOME = cache;
+  process.env.QMD_PPLX_PYTHON = "/must-not-run-python";
+  process.env.QMD_EMBED_MODEL = "stale-saved.gguf";
+  process.env.QMD_PPLX_MODEL = remoteModel;
+  try {
+    const selected = resolveEmbedModel({ embed: "also-stale.gguf" });
+    assert.equal(selected, pplxModelFromEnv());
+    const remote = new LlamaCpp({ embedModel: "stale.gguf" });
+    setDefaultLlamaCpp(remote);
+    const store = createStore(":memory:");
+    store.llm = remote;
+    try {
+      await addDocs(store, false);
+      assert.equal((await generateEmbeddings(store)).errors, 0);
+      assert.equal((await store.searchVec("password", selected, 1))[0]!.displayPath, "check/auth.md");
+      assert.equal((await checkEmbeddingVectorSamples(store.db, selected, getEmbeddingFingerprint(selected), 3)).ok, true);
+      assert.equal(remote.pplx!.config.path, "");
+      assert.equal(remote.pplx!.config.revision, serverFingerprint);
+      assert.equal((await remote.modelExists(selected)).exists, true);
+      assert.deepEqual(await remote.tokenize("雪😀"), [38634, 128512]);
+      assert.equal(await remote.detokenize([38634, 128512]), "雪😀");
+      fault = "bad-tokenizer";
+      await assert.rejects(remote.tokenize("password"), /Invalid PPLX token/);
+      await assert.rejects(remote.detokenize([1]), /Invalid PPLX decoded/);
+      await assert.rejects(remote.pplx!.windows(["one", "two"]), /Invalid PPLX context/);
+      await assert.rejects(remote.embed("password"), /Invalid PPLX token/);
+      fault = undefined;
+      serverFingerprint = "b".repeat(64);
+      await assert.rejects(remote.embed("password", { isQuery: true }), /model changed/);
+      serverFingerprint = "a".repeat(64);
+    } finally { store.close(); await remote.dispose(); setDefaultLlamaCpp(null); }
+    for (const bad of ["", " ", "bad\nmodel"]) {
+      process.env.QMD_PPLX_MODEL = bad;
+      assert.throws(() => resolveEmbedModel(), /QMD_PPLX_MODEL/);
+    }
+    process.env.QMD_PPLX_MODEL = "bad-metadata-model";
+    fault = "bad-info";
+    const recovering = new LlamaCpp();
+    await assert.rejects(recovering.embed("password"), /Invalid PPLX server metadata/);
+    fault = "http";
+    await assert.rejects(recovering.embed("password"), /metadata HTTP 503/);
+    fault = undefined;
+    assert.equal((await recovering.embed("password"))!.embedding.length, 1024);
+    await recovering.dispose();
+    delete process.env.QMD_PPLX_URL;
+    assert.throws(() => resolveEmbedModel(), /QMD_PPLX_URL/);
+  } finally {
+    delete process.env.QMD_PPLX_MODEL;
+    process.env.QMD_PPLX_URL = "http://127.0.0.1:8080/v1/embeddings";
+    for (const [key, value] of [["XDG_CACHE_HOME", oldCache], ["QMD_PPLX_PYTHON", oldPython], ["QMD_EMBED_MODEL", oldEmbed]]) {
+      if (value === undefined) delete process.env[key!]; else process.env[key!] = value;
+    }
+    rmSync(cache, { recursive: true, force: true });
+  }
+  console.log("PASS offline: two-variable remote setup, no client Python/files/revision, identity checks, legacy compatibility, retries, SDK and all search paths");
 }
 
 async function live() {
@@ -375,11 +448,92 @@ async function live() {
   } finally { rmSync(directory, { recursive: true, force: true }); }
 }
 
+async function remoteLive() {
+  assert.ok(process.env.QMD_PPLX_URL && process.env.QMD_PPLX_MODEL, "Set only QMD_PPLX_URL and QMD_PPLX_MODEL for --remote-live");
+  const directory = mkdtempSync(join(tmpdir(), "qmd-pplx-two-vars-"));
+  const oldCache = process.env.XDG_CACHE_HOME;
+  const oldPython = process.env.QMD_PPLX_PYTHON;
+  process.env.XDG_CACHE_HOME = join(directory, "cache");
+  process.env.QMD_PPLX_PYTHON = "/no-client-python-available";
+  const dbPath = join(directory, "check.sqlite");
+  const sdk = await createSdkStore({ dbPath, config: { collections: {}, models: { embed: "obsolete-saved.gguf" } } });
+  setDefaultLlamaCpp(sdk.internal.llm!);
+  try {
+    await addDocs(sdk.internal);
+    const result = await sdk.embed();
+    assert.equal(result.errors, 0);
+    for (const [query, expected] of [["reset a forgotten password", "auth.md"],
+      ["recover database snapshots", "backup.md"], ["water tomato seedlings", "garden.md"]]) {
+      assert.ok((await sdk.searchVector(query!))[0]!.displayPath.endsWith(expected!));
+    }
+    assert.ok((await sdk.search({ queries: [{ type: "vec", query: "password reset" }], rerank: false })).length > 0);
+    const llm = sdk.internal.llm!;
+    const model = llm.embedModelName;
+    assert.equal(llm.pplx!.config.path, "");
+    assert.equal(llm.pplx!.config.remoteModel, process.env.QMD_PPLX_MODEL);
+    assert.match(llm.pplx!.config.revision, /^[a-f0-9]{64}$/);
+    const longBody = "# Workshop\n\n" + Array.from({ length: 36 }, (_, i) => `## Section ${i}\n\n${
+      `Workshop ${i}: keep saw blades sharp and measure timber before cutting. `.repeat(150)}`).join("\n\n");
+    const longHash = await hashContent(longBody);
+    sdk.internal.insertContent(longHash, longBody, "2026-01-01");
+    sdk.internal.insertDocument("check", "workshop.md", "Workshop", longHash, "2026-01-01", "2026-01-01");
+    assert.equal((await sdk.embed()).errors, 0);
+    const longChunks = await chunkDocumentByTokens(longBody);
+    const texts = longChunks.map(chunk => formatDocForEmbedding(chunk.text, "Workshop", model));
+    const windows = await llm.pplx!.windows(texts);
+    assert.ok(windows.length >= 2, "Remote tokenization must split long documents into bounded windows");
+    const [start, end] = windows.at(-1)!;
+    const reproduced = await llm.embedBatch(texts.slice(start, end), { contextual: true });
+    const vector = new Float32Array(Uint8Array.from(storedEmbedding(sdk.internal.db, longHash, start)!).buffer);
+    vector.forEach((value, i) => assert.ok(Math.abs(value - reproduced[0]!.embedding[i]!) < 1e-6));
+    const unicode = "café 雪 👩🏽‍💻 <|chunk_sep|>";
+    assert.equal(await llm.detokenize(await llm.tokenize(unicode)), unicode);
+    assert.equal((await checkEmbeddingVectorSamples(sdk.internal.db, model, getEmbeddingFingerprint(model), 3)).ok, true);
+    const configDir = join(directory, "config");
+    mkdirSync(configDir);
+    writeFileSync(join(configDir, "check.yml"), JSON.stringify({ collections: {}, models: { embed: "obsolete-saved.gguf" } }));
+    const run = promisify(execFile);
+    const env = { ...process.env, INDEX_PATH: dbPath, QMD_CONFIG_DIR: configDir, GGML_METAL_NO_RESIDENCY: "1" };
+    for (const sourceMode of ["1", "0"]) {
+      const cli = await run("./bin/qmd", ["--index", "check", "vsearch", "recover database snapshots", "--json"],
+        { env: { ...env, QMD_SOURCE_MODE: sourceMode }, timeout: 120_000 });
+      assert.ok(new URL(JSON.parse(cli.stdout)[0].file).pathname.endsWith("backup.md"));
+    }
+    const doctor = await run("./bin/qmd", ["--index", "check", "doctor"], { env, timeout: 120_000 });
+    assert.match(doctor.stdout, /server-side tokenizer/);
+    assert.match(doctor.stdout, /QMD_PPLX_MODEL=.*overriding models.embed/);
+    assert.match(doctor.stdout, /QMD_PPLX_URL=/);
+    assert.match(doctor.stdout, /sampled chunks reproduce stored vectors/);
+    const badIdentity = await originalFetch(process.env.QMD_PPLX_URL!, { method: "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: process.env.QMD_PPLX_MODEL,
+        input: "password", expected_fingerprint: "0".repeat(64), task: "query" }) });
+    assert.equal(badIdentity.status, 400);
+    for (const tokenizer of [{ op: "decode", tokens: [-1] }, { op: "windows", texts: ["x"], max_tokens: 999 },
+      { op: "counts", texts: "not a list", task: "document", contextual: true }]) {
+      const response = await originalFetch(process.env.QMD_PPLX_URL!, { method: "POST",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model: process.env.QMD_PPLX_MODEL, input: [], tokenizer }) });
+      assert.equal(response.status, 400);
+    }
+    console.log(JSON.stringify({ remote_live: "PASS", setup: "URL + MODEL only; no client Python, tokenizer files or revision",
+      chunks: result.chunksEmbedded, multi_window: { chunks: longChunks.length, windows: windows.length, reproduced: true },
+      cli: "source + built vsearch and doctor PASS", fingerprint_guard: "PASS" }, null, 2));
+  } finally {
+    await sdk.close();
+    setDefaultLlamaCpp(null);
+    if (oldCache === undefined) delete process.env.XDG_CACHE_HOME; else process.env.XDG_CACHE_HOME = oldCache;
+    if (oldPython === undefined) delete process.env.QMD_PPLX_PYTHON; else process.env.QMD_PPLX_PYTHON = oldPython;
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 try { await offline(); }
 finally {
   globalThis.fetch = originalFetch;
   PplxEmbeddings.prototype.tokenizer = originalTokenizer;
   if (originalUrl === undefined) delete process.env.QMD_PPLX_URL;
   else process.env.QMD_PPLX_URL = originalUrl;
+  if (originalModel === undefined) delete process.env.QMD_PPLX_MODEL;
+  else process.env.QMD_PPLX_MODEL = originalModel;
 }
 if (process.argv.includes("--live")) await live();
+if (process.argv.includes("--remote-live")) await remoteLive();

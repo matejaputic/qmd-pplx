@@ -74,7 +74,7 @@ export async function withNativeStdoutRedirectedToStderr<T>(fn: () => Promise<T>
   }
 }
 
-import { isPplxModel, PplxEmbeddings } from "./pplx.js";
+import { isPplxModel, PplxEmbeddings, pplxModelFromEnv } from "./pplx.js";
 import { homedir } from "os";
 import { dirname, join } from "path";
 import { accessSync, constants, existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
@@ -306,7 +306,7 @@ export type ModelResolutionConfig = {
 };
 
 export function resolveEmbedModel(config?: ModelResolutionConfig): string {
-  return config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
+  return pplxModelFromEnv() || config?.embed || process.env.QMD_EMBED_MODEL || DEFAULT_EMBED_MODEL;
 }
 
 export function resolveGenerateModel(config?: ModelResolutionConfig): string {
@@ -1629,6 +1629,10 @@ export class LlamaCpp implements LLM {
     // For local paths, check if file exists
     if (isPplxModel(modelUri)) {
       const client = new PplxEmbeddings(modelUri);
+      if (client.config.remote) {
+        await client.prepare();
+        return { name: modelUri, exists: true };
+      }
       return { name: modelUri, exists: existsSync(join(client.config.path, "tokenizer.json")), path: client.config.path };
     }
     if (modelUri.startsWith("hf:")) {

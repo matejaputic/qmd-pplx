@@ -20,6 +20,7 @@
     "skills/",
     "scripts/build.mjs",
     "scripts/pplx-tokenizer.py",
+    "scripts/install-pplx-server.py",
     "docs/PPLX.md",
     "scripts/check-package-grammars.mjs",
     "scripts/package-smoke.mjs",
